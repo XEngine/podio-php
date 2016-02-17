@@ -12,7 +12,7 @@ class Podio {
   const PUT = 'PUT';
   const DELETE = 'DELETE';
 
-  public static function setup($client_id, $client_secret, $options = array('session_manager' => null, 'curl_options' => array())) {
+  public static function setup($client_id, $client_secret, $podio_username, $podio_password, $options = array('session_manager' => null, 'curl_options' => array())) {
     // Setup client info
     self::$client_id = $client_id;
     self::$client_secret = $client_secret;
@@ -31,25 +31,17 @@ class Podio {
     curl_setopt(self::$ch, CURLOPT_HEADER, true);
     curl_setopt(self::$ch, CURLINFO_HEADER_OUT, true);
 
-    //Update CA root certificates - require: https://github.com/Kdyby/CurlCaBundle
-    if(class_exists('\\Kdyby\\CurlCaBundle\\CertificateHelper')) {
-      \Kdyby\CurlCaBundle\CertificateHelper::setCurlCaInfo(self::$ch);
-    }
 
     if ($options && !empty($options['curl_options'])) {
       curl_setopt_array(self::$ch, $options['curl_options']);
     }
 
-    self::$session_manager = null;
-    if ($options && !empty($options['session_manager'])) {
-      if (is_string($options['session_manager']) && class_exists($options['session_manager'])) {
-        self::$session_manager = new $options['session_manager'];
-      } else if (is_object($options['session_manager']) && method_exists($options['session_manager'], 'get') && method_exists($options['session_manager'], 'set')) {
-        self::$session_manager = $options['session_manager'];
-      }
-      if (self::$session_manager) {
-        self::$oauth = self::$session_manager->get();
-      }
+
+    if(Cache::has('podio_oauth')){
+      self::authenticate_with_password($podio_username,$podio_password);
+      Cache::put('podio_oauth', Podio::$oauth,480);
+      self::$oauth = Cache::get('podio_oauth');
+
     }
 
     // Register shutdown function for debugging and session management
@@ -99,6 +91,7 @@ class Podio {
         $data['app_token'] = $attributes['app_token'];
 
         $auth_type['identifier'] = $attributes['app_id'];
+        break;
       default:
         break;
     }
@@ -107,16 +100,10 @@ class Podio {
     if ($response = self::request(self::POST, '/oauth/token', $request_data, array('oauth_request' => true))) {
       $body = $response->json_body();
       self::$oauth = new PodioOAuth($body['access_token'], $body['refresh_token'], $body['expires_in'], $body['ref']);
-
       // Don't touch auth_type if we are refreshing automatically as it'll be reset to null
       if ($grant_type !== 'refresh_token') {
         self::$auth_type = $auth_type;
       }
-
-      if (self::$session_manager) {
-        self::$session_manager->set(self::$oauth, self::$auth_type);
-      }
-
       return true;
     }
     return false;
@@ -125,15 +112,14 @@ class Podio {
   public static function clear_authentication() {
     self::$oauth = new PodioOAuth();
 
-    if (self::$session_manager) {
-      self::$session_manager->set(self::$oauth, self::$auth_type);
-    }
+    if(Cache::has('podio_oauth'));
+      Cache::forget('podio_oauth');
   }
 
-  public static function authorize_url($redirect_uri,$scope) {
+  public static function authorize_url($redirect_uri) {
     $parsed_url = parse_url(self::$url);
     $host = str_replace('api.', '', $parsed_url['host']);
-    return 'https://'.$host.'/oauth/authorize?response_type=code&client_id='.self::$client_id.'&redirect_uri='.rawurlencode($redirect_uri).'&scope='.rawurlencode($scope);
+    return 'https://'.$host.'/oauth/authorize?response_type=code&client_id='.self::$client_id.'&redirect_uri='.rawurlencode($redirect_uri);
   }
 
   public static function is_authenticated() {
@@ -188,9 +174,7 @@ class Podio {
         curl_setopt(self::$ch, CURLOPT_CUSTOMREQUEST, self::POST);
         if (!empty($options['upload'])) {
           curl_setopt(self::$ch, CURLOPT_POST, TRUE);
-          if(defined('CURLOPT_SAFE_UPLOAD')) {
-            curl_setopt(self::$ch, CURLOPT_SAFE_UPLOAD, FALSE);
-          }
+          curl_setopt(self::$ch, CURLOPT_SAFE_UPLOAD, FALSE);
           curl_setopt(self::$ch, CURLOPT_POSTFIELDS, $attributes);
           self::$headers['Content-type'] = 'multipart/form-data';
         }
@@ -216,8 +200,8 @@ class Podio {
     }
 
     // Add access token to request
-    if (isset(self::$oauth) && !empty(self::$oauth->access_token) && !(isset($options['oauth_request']) && $options['oauth_request'] == true)) {
-      $token = self::$oauth->access_token;
+    if (Cache::has('podio_oauth')) {
+      $token = Cache::get('podio_oauth')->access_token;
       self::$headers['Authorization'] = "OAuth2 {$token}";
     }
     else {
@@ -296,7 +280,7 @@ class Podio {
         if (strstr($body['error_description'], 'expired_token') || strstr($body['error'], 'invalid_token')) {
           if (self::$oauth->refresh_token) {
             // Access token is expired. Try to refresh it.
-            if (self::authenticate('refresh_token', array('refresh_token' => self::$oauth->refresh_token))) {
+            if (self::authenticate('refresh_token', array('refresh_token' => Cache::get('podio_oauth')->refresh_token))) {
               // Try the original request again.
               return self::request($method, $original_url, $attributes);
             }
@@ -404,14 +388,10 @@ class Podio {
     return $list;
   }
   public static function rate_limit_remaining() {
-    if (isset($last_response->headers['x-rate-limit-remaining'])) {
-      return self::$last_response->headers['x-rate-limit-remaining'];
-   }
+    return self::$last_response->headers['x-rate-limit-remaining'];
   }
   public static function rate_limit() {
-    if (isset($last_response->headers['x-rate-limit'])) {
-      return self::$last_response->headers['x-rate-limit'];
-   }
+    return self::$last_response->headers['x-rate-limit-limit'];
   }
 
   /**
