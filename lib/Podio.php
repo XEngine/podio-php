@@ -37,11 +37,10 @@ class Podio {
     }
 
 
-    if(Cache::has('podio_oauth')){
+    if(!Cache::has('podio_oauth')){
       self::authenticate_with_password($podio_username,$podio_password);
       Cache::put('podio_oauth', Podio::$oauth,480);
       self::$oauth = Cache::get('podio_oauth');
-
     }
 
     // Register shutdown function for debugging and session management
